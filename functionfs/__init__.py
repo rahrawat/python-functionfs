@@ -61,6 +61,7 @@ from .functionfs import (
     DescsHeadV2,
     DescsHead,
     OSDescHeader,
+    OSDescHeaderBCount,
     OSExtCompatDesc,
     OSExtPropDescHead,
     StringsHead,
@@ -228,30 +229,31 @@ def getOSDesc(interface, ext_list):
         List of instances of extended descriptors.
     """
     try:
-        ext_type, = {type(ext_list) for x in ext_list}
+        ext_type, = {type(x) for x in ext_list}
     except ValueError:
         raise TypeError('Extensions of a single type are required.')
-    if isinstance(ext_type, OSExtCompatDesc):
+    if issubclass(ext_type, OSExtCompatDesc):
         wIndex = 4
         kw = {
-            'b': {
-                'bCount': len(ext_list),
-                'Reserved': 0,
-            },
+            'b': OSDescHeaderBCount(
+                bCount=len(ext_list),
+                Reserved=0,
+            ),
         }
-    elif isinstance(ext_type, OSExtPropDescHead):
+    elif issubclass(ext_type, OSExtPropDescHead):
         wIndex = 5
         kw = {
             'wCount': len(ext_list),
         }
     else:
         raise TypeError('Extensions of unexpected type')
+    ext_list_type = ext_type * len(ext_list)
     klass = type(
         'OSDesc',
-        OSDescHeader,
+        (OSDescHeader, ),
         {
             '_fields_': [
-                ('ext_list', ext_type * len(ext_list)),
+                ('ext_list', ext_list_type),
             ],
         },
     )
@@ -260,7 +262,7 @@ def getOSDesc(interface, ext_list):
         dwLength=ctypes.sizeof(klass),
         bcdVersion=1,
         wIndex=wIndex,
-        ext_list=ext_list,
+        ext_list=ext_list_type(*ext_list),
         **kw
     )
 
@@ -278,7 +280,7 @@ def getOSExtPropDesc(data_type, name, value):
     """
     klass = type(
         'OSExtPropDesc',
-        OSExtPropDescHead,
+        (OSExtPropDescHead, ),
         {
             '_fields_': [
                 ('bPropertyName', ctypes.c_char * len(name)),

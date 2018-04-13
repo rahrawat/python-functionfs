@@ -90,6 +90,12 @@ class DescsHead(ctypes.LittleEndianStructure):
         ('hs_count', le32),
     ]
 
+class OSDescHeaderBCount(ctypes.LittleEndianStructure):
+    _fields_ = (
+        ('bCount', u8),
+        ('Reserved', u8),
+    )
+
 class OSDescHeader(ctypes.LittleEndianStructure):
     """
     MS OS Descriptor header
@@ -132,19 +138,7 @@ class OSDescHeader(ctypes.LittleEndianStructure):
                 (ctypes.Union, ),
                 {
                     '_fields_': [
-                        (
-                            'b',
-                            type(
-                                'BCount',
-                                (ctypes.LittleEndianStructure, ),
-                                {
-                                    '_fields_': [
-                                        ('bCount', u8),
-                                        ('Reserved', u8),
-                                    ],
-                                }
-                            ),
-                        ),
+                        ('b', OSDescHeaderBCount),
                         ('wCount', le16),
                     ],
                 },
@@ -164,7 +158,7 @@ class OSExtCompatDesc(OSExt):
     |-----+-----------------------+------+-------------------------------------|
     |   0 | bFirstInterfaceNumber | U8   | index of the interface or of the 1st|
     |     |                       |      | interface in an IAD group           |
-    |   1 | Reserved              | U8   | 0                                   |
+    |   1 | Reserved              | U8   | 1                                   |
     |   2 | CompatibleID          | U8[8]| compatible ID string                |
     |  10 | SubCompatibleID       | U8[8]| subcompatible ID string             |
     |  18 | Reserved              | U8[6]| 0                                   |
