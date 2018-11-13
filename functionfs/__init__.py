@@ -1,5 +1,5 @@
 # This file is part of python-functionfs
-# Copyright (C) 2016  Vincent Pelletier <plr.vincent@gmail.com>
+# Copyright (C) 2016-2018  Vincent Pelletier <plr.vincent@gmail.com>
 #
 # python-functionfs is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -26,6 +26,7 @@ import errno
 import fcntl
 import io
 import itertools
+import math
 import os
 import struct
 import warnings
@@ -52,12 +53,6 @@ from .ch9 import (
 from .functionfs import (
     DESCRIPTORS_MAGIC, STRINGS_MAGIC, DESCRIPTORS_MAGIC_V2,
     FLAGS,
-    HAS_FS_DESC,
-    HAS_HS_DESC,
-    HAS_SS_DESC,
-    HAS_MS_OS_DESC,
-    ALL_CTRL_RECIP,
-    CONFIG0_SETUP,
     DescsHeadV2,
     DescsHead,
     OSDescHeader,
@@ -66,10 +61,20 @@ from .functionfs import (
     OSExtPropDescHead,
     StringsHead,
     StringBase,
-    BIND, UNBIND, ENABLE, DISABLE, SETUP, SUSPEND, RESUME,
     Event,
     FIFO_STATUS, FIFO_FLUSH, CLEAR_HALT, INTERFACE_REVMAP, ENDPOINT_REVMAP, ENDPOINT_DESC,
 )
+# pylint: disable=no-name-in-module
+from .functionfs import (
+    HAS_FS_DESC,
+    HAS_HS_DESC,
+    HAS_SS_DESC,
+    HAS_MS_OS_DESC,
+    ALL_CTRL_RECIP,
+    CONFIG0_SETUP,
+    BIND, UNBIND, ENABLE, DISABLE, SETUP, SUSPEND, RESUME,
+)
+# pylint: enable=no-name-in-module
 
 __all__ = (
     'ch9',
@@ -110,11 +115,12 @@ _MAX_PACKET_SIZE_DICT = {
     ),
 }
 
+_MARKER = object()
 _EMPTY_DICT = {} # For internal ** falback usage
-def getInterfaceInAllSpeeds(interface, endpoint_list):
+def getInterfaceInAllSpeeds(interface, endpoint_list, class_descriptor_list=()):
     """
     Produce similar fs, hs and ss interface and endpoints descriptors.
-    Should be useful for devices desiring to work in all 3 speeds with maimum
+    Should be useful for devices desiring to work in all 3 speeds with maximum
     endpoint wMaxPacketSize. Reduces data duplication from descriptor
     declarations.
     Not intended to cover fancy combinations.
@@ -132,15 +138,28 @@ def getInterfaceInAllSpeeds(interface, endpoint_list):
           getDescriptor(USBEndpointDescriptor, ...)
         The with-audio variant is picked when its extra fields are assigned a
         value.
-        wMaxPacketSize must not be provided, it will be set to the maximum
-        size for given speed and endpoint type.
+        wMaxPacketSize may be missing, in which case it will be set to the
+        maximum size for given speed and endpoint type.
         bmAttributes must be provided.
+        If bEndpointAddress is zero (excluding direction bit) on the first
+        endpoint, endpoints will be assigned their rank in this list,
+        starting at 1. Their direction bit is preserved.
+        If bInterval is present on a INT or ISO endpoint, it must be in
+        millisecond units (but may not be an integer), and will be converted
+        to the nearest integer millisecond for full-speed descriptor, and
+        nearest possible interval for high- and super-speed descriptors.
+        If bInterval is present on a BULK endpoint, it is set to zero on
+        full-speed descriptor and used as provided on high- and super-speed
+        descriptors.
       - "superspeed": optional, contains keyword arguments for
           getDescriptor(USBSSEPCompDescriptor, ...)
       - "superspeed_iso": optional, contains keyword arguments for
           getDescriptor(USBSSPIsocEndpointDescriptor, ...)
         Must be provided and non-empty only when endpoint is isochronous and
         "superspeed" dict has "bmAttributes" bit 7 set.
+    class_descriptor (list of descriptors of any type)
+      Descriptors to insert in all speeds between the interface descriptor and
+      endpoint descriptors.
 
     Returns a 3-tuple of lists:
     - fs descriptors
@@ -152,44 +171,85 @@ def getInterfaceInAllSpeeds(interface, endpoint_list):
         bNumEndpoints=len(endpoint_list),
         **interface
     )
-    fs_list = [interface]
-    hs_list = [interface]
-    ss_list = [interface]
-    for endpoint in endpoint_list:
-        endpoint_kw = endpoint['endpoint']
-        fs_max, hs_max, ss_max = _MAX_PACKET_SIZE_DICT[
-            endpoint_kw['bmAttributes'] & ch9.USB_ENDPOINT_XFERTYPE_MASK
-        ]
+    class_descriptor_list = list(class_descriptor_list)
+    fs_list = [interface] + class_descriptor_list
+    hs_list = [interface] + class_descriptor_list
+    ss_list = [interface] + class_descriptor_list
+    need_address = (
+        endpoint_list[0]['endpoint'].get(
+            'bEndpointAddress',
+            0,
+        ) & ~ch9.USB_DIR_IN == 0
+    )
+    for index, endpoint in enumerate(endpoint_list, 1):
+        endpoint_kw = endpoint['endpoint'].copy()
+        transfer_type = endpoint_kw[
+            'bmAttributes'
+        ] & ch9.USB_ENDPOINT_XFERTYPE_MASK
+        fs_max, hs_max, ss_max = _MAX_PACKET_SIZE_DICT[transfer_type]
+        if need_address:
+            endpoint_kw['bEndpointAddress'] = index | (
+                endpoint_kw.get('bEndpointAddress', 0) & ch9.USB_DIR_IN
+            )
         klass = (
             USBEndpointDescriptor
             if 'bRefresh' in endpoint_kw or 'bSynchAddress' in endpoint_kw else
             USBEndpointDescriptorNoAudio
         )
+        interval = endpoint_kw.pop('bInterval', _MARKER)
+        if interval is _MARKER:
+            fs_interval = hs_interval = 0
+        else:
+            if transfer_type == ch9.USB_ENDPOINT_XFER_BULK:
+                fs_interval = 0
+                hs_interval = interval
+            else: # USB_ENDPOINT_XFER_ISOC or USB_ENDPOINT_XFER_INT
+                fs_interval = max(1, min(255, round(interval)))
+                # 8 is the number of microframes in a millisecond
+                hs_interval = max(
+                    1,
+                    min(16, int(round(1 + math.log(interval * 8, 2)))),
+                )
+        packet_size = endpoint_kw.pop('wMaxPacketSize', _MARKER)
+        if packet_size is _MARKER:
+            fs_packet_size = fs_max
+            hs_packet_size = hs_max
+            ss_packet_size = ss_max
+        else:
+            fs_packet_size = min(fs_max, packet_size)
+            hs_packet_size = min(hs_max, packet_size)
+            ss_packet_size = min(ss_max, packet_size)
         fs_list.append(getDescriptor(
             klass,
             wMaxPacketSize=fs_max,
+            bInterval=fs_interval,
             **endpoint_kw
         ))
         hs_list.append(getDescriptor(
             klass,
             wMaxPacketSize=hs_max,
+            bInterval=hs_interval,
             **endpoint_kw
         ))
         ss_list.append(getDescriptor(
             klass,
             wMaxPacketSize=ss_max,
+            bInterval=hs_interval,
             **endpoint_kw
         ))
+        ss_companion_kw = endpoint.get('superspeed', _EMPTY_DICT)
         ss_list.append(getDescriptor(
             USBSSEPCompDescriptor,
-            **endpoint.get('superspeed', _EMPTY_DICT)
+            **ss_companion_kw
         ))
         ssp_iso_kw = endpoint.get('superspeed_iso', _EMPTY_DICT)
         if bool(ssp_iso_kw) != (
             endpoint_kw.get('bmAttributes', 0) &
             ch9.USB_ENDPOINT_XFERTYPE_MASK ==
             ch9.USB_ENDPOINT_XFER_ISOC and
-            bool(USB_SS_SSP_ISOC_COMP(ss_kw.get('bmAttributes', 0)))
+            bool(ch9.USB_SS_SSP_ISOC_COMP(
+                ss_companion_kw.get('bmAttributes', 0),
+            ))
         ):
             raise ValueError('Inconsistent isochronous companion')
         if ssp_iso_kw:
@@ -216,7 +276,9 @@ def getDescriptor(klass, **kw):
     # XXX: not very pythonic...
     return klass(
         bLength=ctypes.sizeof(klass),
+        # pylint: disable=protected-access
         bDescriptorType=klass._bDescriptorType,
+        # pylint: enable=protected-access
         **kw
     )
 
@@ -298,31 +360,31 @@ def getOSExtPropDesc(data_type, name, value):
         bProperty=value,
     )
 
-def getDescs(*args, **kw):
-    """
-    Return a legacy format FunctionFS suitable for serialisation.
-    Deprecated as of 3.14 .
-
-    NOT IMPLEMENTED
-    """
-    warnings.warn(
-        DeprecationWarning,
-        'Legacy format, deprecated as of 3.14.',
-    )
-    raise NotImplementedError('TODO')
-    klass = type(
-        'Descs',
-        (DescsHead, ),
-        {
-            'fs_descrs': None, # TODO
-            'hs_descrs': None, # TODO
-        },
-    )
-    return klass(
-        magic=DESCRIPTORS_MAGIC,
-        length=ctypes.sizeof(klass),
-        **kw
-    )
+#def getDescs(*args, **kw):
+#    """
+#    Return a legacy format FunctionFS suitable for serialisation.
+#    Deprecated as of 3.14 .
+#
+#    NOT IMPLEMENTED
+#    """
+#    warnings.warn(
+#        DeprecationWarning,
+#        'Legacy format, deprecated as of 3.14.',
+#    )
+#    raise NotImplementedError('TODO')
+#    klass = type(
+#        'Descs',
+#        (DescsHead, ),
+#        {
+#            'fs_descrs': None, # TODO
+#            'hs_descrs': None, # TODO
+#        },
+#    )
+#    return klass(
+#        magic=DESCRIPTORS_MAGIC,
+#        length=ctypes.sizeof(klass),
+#        **kw
+#    )
 
 def getDescsV2(flags, fs_list=(), hs_list=(), ss_list=(), os_list=()):
     """
@@ -368,7 +430,7 @@ def getDescsV2(flags, fs_list=(), hs_list=(), ss_list=(), os_list=()):
                         ),
                     )
             descriptor_map = [
-                ('desc_%i' % x,  y)
+                ('desc_%i' % x, y)
                 for x, y in enumerate(descriptor_list)
             ]
             flags |= flag
@@ -468,9 +530,22 @@ def getStrings(lang_dict):
     )
 
 def serialise(structure):
-    return (ctypes.c_char * ctypes.sizeof(structure)).from_address(ctypes.addressof(structure))
+    """
+    structure (ctypes.Structure)
+        The structure to serialise.
+
+    Returns a ctypes.c_char array.
+    Does not copy memory.
+    """
+    return ctypes.cast(
+        ctypes.pointer(structure),
+        ctypes.POINTER(ctypes.c_char * ctypes.sizeof(structure)),
+    ).contents
 
 class EndpointFileBase(io.FileIO):
+    """
+    File object representing a endpoint. Abstract.
+    """
     def _ioctl(self, func, *args, **kw):
         result = fcntl.ioctl(self, func, *args, **kw)
         if result < 0:
@@ -505,7 +580,7 @@ class Endpoint0File(EndpointFileBase):
             return self._ioctl(INTERFACE_REVMAP, interface)
         except IOError as exc:
             if exc.errno == errno.EDOM:
-                return
+                return None
             raise
 
     # TODO: Add any standard IOCTL in usb_gadget_ops.ioctl ?
@@ -569,6 +644,9 @@ class EndpointFile(EndpointFileBase):
         self._halted = True
 
     def isHalted(self):
+        """
+        Whether endpoint is currently halted.
+        """
         return self._halted
 
 class EndpointINFile(EndpointFile):
@@ -576,7 +654,7 @@ class EndpointINFile(EndpointFile):
     Write-only endpoint file.
     """
     @staticmethod
-    def read(*args, **kw):
+    def read(*_, **__):
         """
         Always raises IOError.
         """
@@ -586,7 +664,11 @@ class EndpointINFile(EndpointFile):
     readlines = read
     readline = read
 
-    def readable(self):
+    @staticmethod
+    def readable():
+        """
+        Never readable.
+        """
         return False
 
     def _halt(self):
@@ -597,14 +679,18 @@ class EndpointOUTFile(EndpointFile):
     Read-only endpoint file.
     """
     @staticmethod
-    def write(*args, **kw):
+    def write(*_, **__):
         """
         Always raises IOError.
         """
         raise IOError('File not open for writing')
     writelines = write
 
-    def writable(self):
+    @staticmethod
+    def writable():
+        """
+        Never writable.
+        """
         return False
 
     def _halt(self):
@@ -616,9 +702,19 @@ _ONCE = (None, )
 class Function(object):
     """
     Pythonic class for interfacing with FunctionFS.
+
+    Properties available:
+        function_remote_wakeup_capable (bool)
+            Whether the function wishes to be allowed to wake host.
+        function_remote_wakeup (bool)
+            Whether host has allowed the function to wake it up.
+            Set and cleared by onSetup by calling enableRemoteWakeup and
+            disableRemoteWakeup, respectively.
     """
     _closed = False
     _ep_list = () # Avoids failing in __del__ when (subclass') __init__ fails.
+    function_remote_wakeup_capable = False
+    function_remote_wakeup = False
 
     def __init__(
         self,
@@ -658,6 +754,9 @@ class Function(object):
             flags |= ALL_CTRL_RECIP
         if config0_setup:
             flags |= CONFIG0_SETUP
+        # Note: serialise does not prevent its argument from being freed and
+        # reallocated. Keep strong references to to-serialise values until
+        # after they get written.
         desc = getDescsV2(
             flags,
             fs_list=fs_list,
@@ -665,12 +764,14 @@ class Function(object):
             ss_list=ss_list,
             os_list=os_list,
         )
-        desc_s = serialise(desc)
-        ep0.write(desc_s)
+        ep0.write(serialise(desc))
         # TODO: try v1 on failure ?
+        del desc
+        # Note: see above.
         strings = getStrings(lang_dict)
         ep0.write(serialise(strings))
-        for descriptor in fs_list or hs_list or ss_list:
+        del strings
+        for descriptor in ss_list or hs_list or fs_list:
             if descriptor.bDescriptorType == ch9.USB_DT_ENDPOINT:
                 assert descriptor.bEndpointAddress not in ep_address_dict, (
                     descriptor,
@@ -754,7 +855,7 @@ class Function(object):
                             setup.wIndex,
                             setup.wLength,
                         )
-                    except BaseException:
+                    except:
                         # On *ANY* exception, halt endpoint
                         self.ep0.halt(setup.bRequestType)
                         raise
@@ -814,12 +915,12 @@ class Function(object):
     def onEnable(self):
         """
         Called when FunctionFS signals the function was (re)enabled.
-        This may happen several times without onDisable being called, which
-        must reset the function to its default state.
+        This may happen several times without onDisable being called.
+        It must reset the function to its default state.
 
         May be overridden in subclass.
         """
-        pass
+        self.disableRemoteWakeup()
 
     def onDisable(self):
         """
@@ -829,6 +930,28 @@ class Function(object):
         May be overridden in subclass.
         """
         pass
+
+    def disableRemoteWakeup(self):
+        """
+        Called when host issues a clearFeature request of the "suspend" flag
+        on this interface.
+        Sets function_remote_wakeup property to False so subsequent getStatus
+        requests will return expected value.
+
+        May be overridden in subclass.
+        """
+        self.function_remote_wakeup = False
+
+    def enableRemoteWakeup(self):
+        """
+        Called when host issues a setFeature request of the "suspend" flag
+        on this interface.
+        Sets function_remote_wakeup property to True so subsequent getStatus
+        requests will return expected value.
+
+        May be overridden in subclass.
+        """
+        self.function_remote_wakeup = True
 
     def onSetup(self, request_type, request, value, index, length):
         """
@@ -840,7 +963,8 @@ class Function(object):
         - handles USB_REQ_SET_FEATURE(USB_ENDPOINT_HALT) on endpoints
         - halts on everything else
 
-        If this method raises anything, endpoint 0 is halted by its caller.
+        If this method raises anything, endpoint 0 is halted by its caller and
+        exception is let through.
 
         May be overridden in subclass.
         """
@@ -850,31 +974,65 @@ class Function(object):
             if request == ch9.USB_REQ_GET_STATUS:
                 if is_in and length == 2:
                     if recipient == ch9.USB_RECIP_INTERFACE:
-                        self.ep0.write(b'\x00\x00')
-                        return
+                        if value == 0:
+                            status = 0
+                            if index == 0:
+                                if self.function_remote_wakeup_capable:
+                                    status |= 1 << 0
+                                if self.function_remote_wakeup:
+                                    status |= 1 << 1
+                            self.ep0.write(struct.pack('<H', status)[:length])
+                            return
                     elif recipient == ch9.USB_RECIP_ENDPOINT:
-                        self.ep0.write(
-                            struct.pack(
-                                'BB',
-                                0,
-                                1 if self.getEndpoint(index).isHalted() else 0,
-                            ),
-                        )
-                        return
+                        if value == 0:
+                            try:
+                                endpoint = self.getEndpoint(index)
+                            except IndexError:
+                                pass
+                            else:
+                                status = 0
+                                if endpoint.isHalted():
+                                    status |= 1 << 0
+                                self.ep0.write(
+                                    struct.pack('<H', status)[:length],
+                                )
+                                return
             elif request == ch9.USB_REQ_CLEAR_FEATURE:
                 if not is_in and length == 0:
                     if recipient == ch9.USB_RECIP_ENDPOINT:
                         if value == ch9.USB_ENDPOINT_HALT:
-                            self.getEndpoint(index).clearHalt()
-                            self.ep0.read(0)
-                            return
+                            try:
+                                endpoint = self.getEndpoint(index)
+                            except IndexError:
+                                pass
+                            else:
+                                endpoint.clearHalt()
+                                self.ep0.read(0)
+                                return
+                    elif recipient == ch9.USB_RECIP_INTERFACE:
+                        if value == ch9.USB_INTRF_FUNC_SUSPEND:
+                            if self.function_remote_wakeup_capable:
+                                self.disableRemoteWakeup()
+                                self.ep0.read(0)
+                                return
             elif request == ch9.USB_REQ_SET_FEATURE:
                 if not is_in and length == 0:
                     if recipient == ch9.USB_RECIP_ENDPOINT:
                         if value == ch9.USB_ENDPOINT_HALT:
-                            self.getEndpoint(index).halt()
-                            self.ep0.read(0)
-                            return
+                            try:
+                                endpoint = self.getEndpoint(index)
+                            except IndexError:
+                                pass
+                            else:
+                                endpoint.halt()
+                                self.ep0.read(0)
+                                return
+                    elif recipient == ch9.USB_RECIP_INTERFACE:
+                        if value == ch9.USB_INTRF_FUNC_SUSPEND:
+                            if self.function_remote_wakeup_capable:
+                                self.enableRemoteWakeup()
+                                self.ep0.read(0)
+                                return
         self.ep0.halt(request_type)
 
     def onSuspend(self):

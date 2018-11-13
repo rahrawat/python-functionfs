@@ -1,5 +1,5 @@
 # This file is part of python-functionfs
-# Copyright (C) 2016  Vincent Pelletier <plr.vincent@gmail.com>
+# Copyright (C) 2016-2018  Vincent Pelletier <plr.vincent@gmail.com>
 #
 # python-functionfs is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -125,7 +125,7 @@ def main():
             if ep & 0xf0:
                 buf[0] = 0
             else:
-                for offset in range(len(buf)):
+                for offset, _ in enumerate(buf):
                     buf[offset] = ep
             size[0] = 0
             for transfer in transfer_list:

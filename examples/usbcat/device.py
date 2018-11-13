@@ -1,6 +1,6 @@
 #!/usr/bin/env python -u
 # This file is part of python-functionfs
-# Copyright (C) 2016  Vincent Pelletier <plr.vincent@gmail.com>
+# Copyright (C) 2016-2018  Vincent Pelletier <plr.vincent@gmail.com>
 #
 # python-functionfs is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -58,12 +58,12 @@ class USBCat(functionfs.Function):
             endpoint_list=[
                 {
                     'endpoint': {
-                        'bEndpointAddress': 1 | functionfs.ch9.USB_DIR_IN,
+                        'bEndpointAddress': functionfs.ch9.USB_DIR_IN,
                         'bmAttributes': functionfs.ch9.USB_ENDPOINT_XFER_BULK,
                     },
                 }, {
                     'endpoint': {
-                        'bEndpointAddress': 2 | functionfs.ch9.USB_DIR_OUT,
+                        'bEndpointAddress': functionfs.ch9.USB_DIR_OUT,
                         'bmAttributes': functionfs.ch9.USB_ENDPOINT_XFER_BULK,
                     },
                 },
@@ -83,12 +83,12 @@ class USBCat(functionfs.Function):
         to_host = self.getEndpoint(2)
         self._aio_recv_block_list = [
             libaio.AIOBlock(
-                libaio.AIOBLOCK_MODE_READ,
-                to_host,
-                [bytearray(BUF_SIZE)],
-                0,
-                eventfd,
-                self._onReceived,
+                mode=libaio.AIOBLOCK_MODE_READ,
+                target_file=to_host,
+                buffer_list=[bytearray(BUF_SIZE)],
+                offset=0,
+                eventfd=eventfd,
+                onCompletion=self._onReceived,
             )
             for _ in xrange(PENDING_READ_COUNT)
         ]
@@ -160,7 +160,7 @@ class USBCat(functionfs.Function):
         """
         event_count = self.eventfd.read()
         trace('eventfd reports %i events' % event_count)
-        # Event though eventfd signaled activity, even though it may give us
+        # Even though eventfd signaled activity, even though it may give us
         # some number of pending events, some events seem to have been already
         # processed (maybe during io_cancel call ?).
         # So do not trust eventfd value, and do not even trust that there must
@@ -200,12 +200,12 @@ class USBCat(functionfs.Function):
             Value to send.
         """
         aio_block = libaio.AIOBlock(
-            libaio.AIOBLOCK_MODE_WRITE,
-            self.getEndpoint(1),
-            [bytearray(value)],
-            0,
-            self.eventfd,
-            self._onCanSend,
+            mode=libaio.AIOBLOCK_MODE_WRITE,
+            target_file=self.getEndpoint(1),
+            buffer_list=[bytearray(value)],
+            offset=0,
+            eventfd=self.eventfd,
+            onCompletion=self._onCanSend,
         )
         self._aio_send_block_list.append(aio_block)
         self._aio_context.submit([aio_block])

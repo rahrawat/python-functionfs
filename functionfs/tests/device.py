@@ -1,5 +1,5 @@
 # This file is part of python-functionfs
-# Copyright (C) 2016  Vincent Pelletier <plr.vincent@gmail.com>
+# Copyright (C) 2016-2018  Vincent Pelletier <plr.vincent@gmail.com>
 #
 # python-functionfs is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -137,9 +137,10 @@ class FunctionFSTestDevice(functionfs.Function):
                 print('Succeeded with', len(ep_list), 'endpoints')
                 break
         if not ep_list:
+            # pylint: disable=misplaced-bare-raise
             raise
+            # pylint: enable=misplaced-bare-raise
         self.__echo_payload = 'NOT SET'
-        ep_echo_payload_bulk = bytearray(0x10000)
         assert len(self._ep_list) == len(ep_list) + 1
         thread_list = self.__thread_list = []
         for ep_file in self._ep_list[1:]:
